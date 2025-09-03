@@ -15,11 +15,11 @@ import torch.optim as optim
 import tyro
 from mani_skill.utils import gym_utils
 from mani_skill.utils.io_utils import load_json
+from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-
 
 from behavior_cloning.evaluate import evaluate
 from behavior_cloning.make_env import make_eval_envs
@@ -27,9 +27,9 @@ from behavior_cloning.make_env import make_eval_envs
 
 @dataclass
 class Args:
-    exp_name: Optional[str] = "behavior_cloning"
+    exp_name: Optional[str] = None
     """the name of this experiment"""
-    seed: int = 42
+    seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
@@ -56,6 +56,8 @@ class Args:
     """the batch size of sample from the replay memory"""
 
     # Behavior cloning specific arguments
+    normalize_states: bool = False
+    """if toggled, states are normalized to mean 0 and standard deviation 1"""
     lr: float = 3e-4
     """the learning rate for the actor"""
     normalize_states: bool = False
@@ -75,7 +77,7 @@ class Args:
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
-    sim_backend: str = "gpu"
+    sim_backend: str = "cpu"
     """the simulation backend to use for evaluation environments. can be "cpu" or "gpu"""
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
@@ -84,6 +86,137 @@ class Args:
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
+
+
+def load_h5_data(data):
+    out = dict()
+    for k in data.keys():
+        if isinstance(data[k], h5py.Dataset):
+            out[k] = data[k][:]
+        else:
+            out[k] = load_h5_data(data[k])
+    return out
+
+
+def make_mlp(in_channels, mlp_channels, act_builder=nn.ReLU, last_act=True):
+    c_in = in_channels
+    module_list = []
+    for idx, c_out in enumerate(mlp_channels):
+        module_list.append(nn.Linear(c_in, c_out))
+        if last_act or idx < len(mlp_channels) - 1:
+            module_list.append(act_builder())
+        c_in = c_out
+    return nn.Sequential(*module_list)
+
+
+def flatten_state_dict_with_space(state_dict: dict) -> np.ndarray:
+    states = []
+    for key in state_dict.keys():
+        value = state_dict[key]
+        if isinstance(value, (tuple, list)):
+            state = None if len(value) == 0 else value
+        elif isinstance(value, (bool, np.bool_, int, np.int32, np.int64)):
+            # x = np.array(1) > 0 is np.bool_ instead of ndarray
+            state = int(value)
+        elif isinstance(value, (float, np.float32, np.float64)):
+            state = np.float32(value)
+        elif isinstance(value, np.ndarray) or isinstance(value, torch.Tensor):
+            if value.ndim > 2:
+                raise AssertionError(
+                    "The dimension of {} should not be more than 2.".format(key)
+                )
+            state = value
+        else:
+            raise TypeError("Unsupported type: {}".format(type(value)))
+        if state is not None:
+            states.append(state)
+    if len(states) == 0:
+        return np.empty(0)
+    else:
+        if isinstance(states[0], torch.Tensor):
+            try:
+                return torch.hstack(states)
+            except:
+                return torch.column_stack(states)
+        else:
+            try:
+                return np.hstack(states)
+            except:  # dirty fix for concat trajectory of states
+                return np.column_stack(states)
+
+
+class ManiSkillDataset(Dataset):
+    def __init__(self, dataset_file: str, device: torch.device, load_count) -> None:
+        self.dataset_file = dataset_file
+        # for details on how the code below works, see the
+        # quick start tutorial
+        self.data = h5py.File(dataset_file, "r")
+        json_path = dataset_file.replace(".h5", ".json")
+        self.json_data = load_json(json_path)
+        self.episodes = self.json_data["episodes"]
+
+        self.env_info = self.json_data["env_info"]
+        self.env_id = self.env_info["env_id"]
+        self.env_kwargs = self.env_info["env_kwargs"]
+
+        self.camera_data = defaultdict(list)
+        self.actions = []
+        self.dones = []
+        self.states = []
+        self.total_frames = 0
+        self.device = device
+
+        if load_count is None:
+            load_count = len(self.episodes)
+
+        for eps_id in tqdm(range(load_count)):
+            eps = self.episodes[eps_id]
+            trajectory = self.data[f"traj_{eps['episode_id']}"]
+            trajectory = load_h5_data(trajectory)
+            agent = trajectory["obs"]["agent"]
+            extra = trajectory["obs"]["extra"]
+
+            state = np.hstack(
+                [
+                    flatten_state_dict_with_space(agent),
+                    flatten_state_dict_with_space(extra),
+                ]
+            )
+            self.states.append(state)
+
+            # we use :-1 here to ignore the last observation as that
+            # is the terminal observation which has no actions
+            for camera_name, camera_data in trajectory["obs"]["sensor_data"].items():
+                self.camera_data[camera_name + "_rgb"].append(camera_data["rgb"][:-1])
+                self.camera_data[camera_name + "_depth"].append(camera_data["depth"][:-1])
+     
+            self.actions.append(trajectory["actions"])
+        for key in self.camera_data.keys():
+            if "rgb" in key:
+                self.camera_data[key] = np.vstack(self.camera_data[key]) / 255.0
+            else:
+                self.camera_data[key] = np.vstack(self.camera_data[key]) / 1024.0
+            
+        self.states = np.vstack(self.states)
+        self.actions = np.vstack(self.actions)
+        for key in self.camera_data.keys():
+            assert self.camera_data[key].shape[0] == self.actions.shape[0]
+
+    def __len__(self):
+        return len(self.camera_data[list(self.camera_data.keys())[0]])
+
+    def __getitem__(self, idx):
+        out = {}
+        out["action"] = (
+            torch.from_numpy(self.actions[idx]).float().to(device=self.device)
+        )
+        out["state"] = torch.from_numpy(self.states[idx]).float().to(device=self.device)
+        rgbd_data = []
+        for key in sorted(self.camera_data.keys()):
+            rgbd_data.append(torch.from_numpy(self.camera_data[key][idx]).float().to(device=self.device))
+        out["rgbd"] = torch.cat(rgbd_data, dim=-1)
+
+        return out
 
 
 # taken from here
@@ -117,96 +250,76 @@ class IterationBasedBatchSampler(BatchSampler):
         return self.num_iterations
 
 
-def load_h5_data(data):
-    out = dict()
-    for k in data.keys():
-        if isinstance(data[k], h5py.Dataset):
-            out[k] = data[k][:]
-        else:
-            out[k] = load_h5_data(data[k])
-    return out
-
-
-class ManiSkillDataset(Dataset):
+class PlainConv(nn.Module):
     def __init__(
         self,
-        dataset_file: str,
-        device,
-        load_count=-1,
-        normalize_states=False,
-    ) -> None:
-        self.dataset_file = dataset_file
-        # for details on how the code below works, see the
-        # quick start tutorial
-        self.data = h5py.File(dataset_file, "r")
-        json_path = dataset_file.replace(".h5", ".json")
-        self.json_data = load_json(json_path)
-        self.episodes = self.json_data["episodes"]
+        in_channels=4,
+        out_dim=256,
+        max_pooling=True,
+        inactivated_output=False,  # False for ConvBody, True for CNN
+    ):
+        super().__init__()
 
-        self.env_info = self.json_data["env_info"]
-        self.env_id = self.env_info["env_id"]
-        self.env_kwargs = self.env_info["env_kwargs"]
-
-        self.observations = []
-        self.actions = []
-        self.dones = []
-        self.total_frames = 0
-        self.device = device
-        if load_count is None:
-            load_count = len(self.episodes)
-        print(f"Loading {load_count} episodes")
-
-        for eps_id in tqdm(range(load_count)):
-            eps = self.episodes[eps_id]
-            trajectory = self.data[f"traj_{eps['episode_id']}"]
-            trajectory = load_h5_data(trajectory)
-
-            # print(trajectory.type) # trajectory dictionary
-            # print(trajectory.keys()) # dict_keys(['obs', 'actions', 'terminated', 'truncated', 'success', 'env_states', 'rewards'])
-            # print(trajectory['actions'])
-
-            # we use :-1 here to ignore the last observation as that
-            # is the terminal observation which has no actions
-            self.observations.append(trajectory["obs"][:-1])
-            self.actions.append(trajectory["actions"])
-            self.dones.append(trajectory["success"].reshape(-1, 1))
-
-        self.observations = np.vstack(self.observations)
-        self.actions = np.vstack(self.actions)
-        self.dones = np.vstack(self.dones)
-        assert self.observations.shape[0] == self.actions.shape[0]
-        assert self.dones.shape[0] == self.actions.shape[0]
-
-        if normalize_states:
-            mean, std = self.get_state_stats()
-            self.observations = (self.observations - mean) / std
-
-    def get_state_stats(self):
-        return np.mean(self.observations), np.std(self.observations)
-
-    def __len__(self):
-        return len(self.observations)
-
-    def __getitem__(self, idx):
-        action = torch.from_numpy(self.actions[idx]).float().to(device=self.device)
-        obs = torch.from_numpy(self.observations[idx]).float().to(device=self.device)
-        done = torch.from_numpy(self.dones[idx]).to(device=self.device)
-        return obs, action, done
-
-class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
-        super(Actor, self).__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, action_dim),
+        self.cnn = nn.Sequential(
+            nn.Conv2d(in_channels, 16, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # [64, 64]
+            nn.Conv2d(16, 16, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # [32, 32]
+            nn.Conv2d(16, 32, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # [16, 16]
+            nn.Conv2d(32, 64, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # [8, 8]
+            nn.Conv2d(64, 128, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # [4, 4]
+            nn.Conv2d(128, 128, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
         )
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.net(state)
+        if max_pooling:
+            self.pool = nn.AdaptiveMaxPool2d((1, 1))
+            self.fc = make_mlp(128, [out_dim], last_act=not inactivated_output)
+        else:
+            self.pool = None
+            self.fc = make_mlp(128 * 4 * 4, [out_dim], last_act=not inactivated_output)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for name, module in self.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, image):
+        x = self.cnn(image)
+        if self.pool is not None:
+            x = self.pool(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        return x
+
+
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, camera_count=1):
+        super().__init__()
+        self.encoder = PlainConv(
+            in_channels=4 * camera_count, out_dim=256, max_pooling=False, inactivated_output=False
+        )
+        self.final_mlp = make_mlp(
+            256 + state_dim, [512, 256, action_dim], last_act=False
+        )
+        self.get_eval_action = self.get_action = self.forward
+
+    def forward(self, rgbd, state):
+        img = rgbd.permute(0, 3, 1, 2)  # (B, C, H, W)
+        feature = self.encoder(img)
+        x = torch.cat([feature, state], dim=1)
+        return self.final_mlp(x)
 
 
 def save_ckpt(run_name, tag):
@@ -247,16 +360,17 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.torch_deterministic
+    torch.use_deterministic_algorithms(args.torch_deterministic)
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    control_mode = os.path.split(args.demo_path)[1].split(".")[2]
 
     # env setup
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
-        obs_mode="state",
-        render_mode="rgb_array",
+        obs_mode="rgbd",
+        render_mode="all",
     )
     if args.max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
@@ -266,6 +380,7 @@ if __name__ == "__main__":
         args.sim_backend,
         env_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
+        wrappers=[FlattenRGBDObservationWrapper],
     )
 
     if args.track:
@@ -299,32 +414,29 @@ if __name__ == "__main__":
         args.demo_path,
         device=device,
         load_count=args.num_demos,
-        normalize_states=args.normalize_states,
     )
 
     obs, _ = envs.reset(seed=args.seed)
 
     sampler = RandomSampler(ds)
-    batchsampler = BatchSampler(sampler, args.batch_size, drop_last=True)
-    itersampler = IterationBasedBatchSampler(batchsampler, args.total_iters)
-    dataloader = DataLoader(
-        ds, batch_sampler=itersampler, num_workers=args.num_dataload_workers
-    )
-    actor = Actor(
-        envs.single_observation_space.shape[0], envs.single_action_space.shape[0]
-    )
-    actor = actor.to(device=device)
-    optimizer = optim.Adam(actor.parameters(), lr=args.lr)
+    batch_sampler = BatchSampler(sampler, args.batch_size, drop_last=True)
+    camera_count = len(ds.camera_data.keys()) // 2 # each camera has rgb and depth
+    iter_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
 
+    data_loader = DataLoader(ds, batch_sampler=iter_sampler, num_workers=0)
+    actor = Actor(ds.states.shape[1], envs.single_action_space.shape[0], camera_count).to(
+        device=device
+    )
+
+    optimizer = optim.Adam(actor.parameters(), lr=args.lr)
     best_eval_metrics = defaultdict(float)
 
-    for iteration, batch in enumerate(dataloader):
+    for iteration, batch in enumerate(data_loader):
         log_dict = {}
-        obs, action, _ = batch
-        pred_action = actor(obs)
 
         optimizer.zero_grad()
-        loss = F.mse_loss(pred_action, action)
+        preds = actor(batch["rgbd"], batch["state"])
+        loss = F.mse_loss(preds, batch["action"])
         loss.backward()
         optimizer.step()
 
@@ -337,11 +449,13 @@ if __name__ == "__main__":
 
         if iteration % args.eval_freq == 0:
             actor.eval()
-
             def sample_fn(obs):
-                if isinstance(obs, np.ndarray):
-                    obs = torch.from_numpy(obs).float().to(device)
-                action = actor(obs)
+                if isinstance(obs["rgbd"], np.ndarray):
+                    for k, v in obs.items():
+                        obs[k] = torch.from_numpy(v).float().to(device)
+                else:
+                    obs["rgbd"] = obs["rgbd"].float().to(device)
+                action = actor(obs["rgbd"], obs["state"])
                 if args.sim_backend == "cpu":
                     action = action.cpu().numpy()
                 return action
