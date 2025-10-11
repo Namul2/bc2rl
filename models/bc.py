@@ -27,7 +27,7 @@ from behavior_cloning.make_env import make_eval_envs
 
 @dataclass
 class Args:
-    exp_name: Optional[str] = "behavior_cloning"
+    exp_name: Optional[str] = None
     """the name of this experiment"""
     seed: int = 42
     """seed of the experiment"""
