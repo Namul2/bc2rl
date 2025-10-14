@@ -46,13 +46,46 @@
 #   --bc_epochs 2000 \
 #   --total_timesteps 100000000
 
-python models/bc2rl_regularization.py \
+# python models/bc2rl_state.py \
+#   --env_id PushT-v1 \
+#   --demo-path ~/.maniskill/demos/PushT-v1/rl/trajectory.state.pd_ee_delta_pos.physx_cuda.h5 \
+#   --control-mode "pd_ee_delta_pos" \
+#   --bc_epochs 200 \
+#   --max_episode_steps 100 \
+#   --total_timesteps 10000000 \
+#   --num_envs 32 \
+#   --bc_reg_coef 0.3 \
+#   --bc_reg_min 0 \
+#   --bc_reg_decay_steps 200000 \
+
+
+python models/bc2rl_state.py \
   --env_id PushT-v1 \
   --demo-path ~/.maniskill/demos/PushT-v1/rl/trajectory.state.pd_ee_delta_pos.physx_cuda.h5 \
   --control-mode "pd_ee_delta_pos" \
-  --bc_epochs 1000 \
+  --bc_epochs 0 \
   --max_episode_steps 100 \
-  --total_timesteps 100000000
+  --total_timesteps 100000000 \
+  --num_envs 512 \
+  --bc_reg_coef 0 \
+  --bc_reg_min 0 \
+  --bc_reg_decay_steps 10 \
+  --eval_freq 10
+
+
+python models/bc2rl_state.py \
+  --env_id PushT-v1 \
+  --demo-path ~/.maniskill/demos/PushT-v1/rl/trajectory.state.pd_ee_delta_pos.physx_cuda.h5 \
+  --control-mode "pd_ee_delta_pos" \
+  --bc_epochs 150 \
+  --max_episode_steps 100 \
+  --total_timesteps 100000000 \
+  --num_envs 128 \
+  --bc_reg_coef 0.5 \
+  --bc_reg_min 0 \
+  --bc_reg_decay_steps 5000 \
+  --eval_freq 10
+
 
 
 

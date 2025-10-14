@@ -850,7 +850,7 @@ if __name__ == "__main__":
     
     # Evaluation environments
     eval_env_kwargs = env_kwargs.copy()
-    eval_env_kwargs["sim_backend"] = args.sim_backend
+    # eval_env_kwargs["sim_backend"] = args.sim_backend
     
     eval_envs = make_eval_envs(
         args.env_id,
